@@ -322,18 +322,66 @@ class NotificationManager:
                 except Exception as e:
                     self.logger.warning(f"win10toast failed: {e}. Trying next backend.")
 
+feature/bulletproof-hotfix
+            # 3. Fallback to custom Toplevel window
+            try:
+                if self.root:
+                    self.root.after(0, self._show_fallback_notification, safe_title, safe_message)
+
             # 3. Fallback to Tkinter messagebox
             try:
                 # Ensure this is run on the main GUI thread
                 if hasattr(self, 'root') and self.root and self.root.winfo_exists():
                     self.root.after(0, lambda: messagebox.showinfo(safe_title, safe_message))
                     self.logger.info("Notification sent via Tkinter fallback.")
+    main
                 else:
                     self.logger.warning("Cannot show Tkinter fallback, root window not available.")
             except Exception as e:
                 self.logger.error(f"All notification methods failed: {e}")
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_fallback_notification(self, title: str, message: str):
+        """A custom Toplevel window for notifications."""
+        try:
+            if not self.root or not self.root.winfo_exists():
+                return
+
+            fallback_window = tk.Toplevel(self.root)
+            fallback_window.title(title)
+            fallback_window.geometry("350x120")
+            fallback_window.resizable(False, False)
+            fallback_window.configure(bg='#334155') # Slate-700
+
+            # Center the window
+            root_x = self.root.winfo_x()
+            root_y = self.root.winfo_y()
+            root_w = self.root.winfo_width()
+            root_h = self.root.winfo_height()
+            win_w = 350
+            win_h = 120
+            x = root_x + (root_w // 2) - (win_w // 2)
+            y = root_y + (root_h // 2) - (win_h // 2)
+            fallback_window.geometry(f'+{x}+{y}')
+
+            label = tk.Label(fallback_window, text=message, wraplength=330,
+                             bg='#334155', fg='white', font=('Segoe UI', 10))
+            label.pack(padx=15, pady=15, expand=True, fill='both')
+
+            ok_button = tk.Button(fallback_window, text="OK",
+                                  command=fallback_window.destroy,
+                                  width=10, bg='#475569', fg='white',
+                                  activebackground='#64748B',
+                                  border=0)
+            ok_button.pack(pady=(0, 10))
+
+            fallback_window.lift()
+            fallback_window.focus_force()
+            fallback_window.grab_set()
+            fallback_window.after(10000, fallback_window.destroy) # Auto-close after 10s
+        except Exception as e:
+            self.logger.error(f"Failed to show custom fallback notification: {e}")
 
 def get_resource_path(rel_path: str) -> str:
     """
@@ -1233,6 +1281,7 @@ class CryptoPulseMonitor:
 
     def on_minimize(self, event=None):
         """Handle minimize button - hide window and show tray icon"""
+        logger.info("on_minimize triggered")
         try:
             if hasattr(self, 'gui_initialized') and not self.gui_initialized:
                 return
@@ -1270,6 +1319,9 @@ class CryptoPulseMonitor:
 
     def minimize_to_tray(self) -> None:
         """Harden tray lifecycle with lock, daemon thread, single retry, and guaranteed resets."""
+ feature/bulletproof-hotfix
+        logger.info("minimize_to_tray called")
+        main
         if not SYSTEM_TRAY_AVAILABLE or not self.settings.get('ui_config', {}).get('enable_system_tray', True):
             self.safe_iconify()
             return
@@ -1379,6 +1431,7 @@ class CryptoPulseMonitor:
 
     def restore_window(self) -> None:
         """BULLETPROOF window restoration with cross-platform safeguards"""
+        logger.info("restore_window called")
         # Stop tray if running, ignore errors
         with self.tray_lock:
             if self.tray_icon is not None:
