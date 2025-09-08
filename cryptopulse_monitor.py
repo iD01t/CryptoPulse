@@ -322,10 +322,19 @@ class NotificationManager:
                 except Exception as e:
                     self.logger.warning(f"win10toast failed: {e}. Trying next backend.")
 
+feature/bulletproof-hotfix
             # 3. Fallback to custom Toplevel window
             try:
                 if self.root:
                     self.root.after(0, self._show_fallback_notification, safe_title, safe_message)
+
+            # 3. Fallback to Tkinter messagebox
+            try:
+                # Ensure this is run on the main GUI thread
+                if hasattr(self, 'root') and self.root and self.root.winfo_exists():
+                    self.root.after(0, lambda: messagebox.showinfo(safe_title, safe_message))
+                    self.logger.info("Notification sent via Tkinter fallback.")
+    main
                 else:
                     self.logger.warning("Cannot show Tkinter fallback, root window not available.")
             except Exception as e:
@@ -1310,7 +1319,9 @@ class CryptoPulseMonitor:
 
     def minimize_to_tray(self) -> None:
         """Harden tray lifecycle with lock, daemon thread, single retry, and guaranteed resets."""
+ feature/bulletproof-hotfix
         logger.info("minimize_to_tray called")
+        main
         if not SYSTEM_TRAY_AVAILABLE or not self.settings.get('ui_config', {}).get('enable_system_tray', True):
             self.safe_iconify()
             return
