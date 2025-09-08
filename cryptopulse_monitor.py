@@ -50,6 +50,7 @@ import json
 import time
 import threading
 import logging
+import logging.handlers
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Union
@@ -92,19 +93,33 @@ sys.excepthook = global_exception_hook
 
 # Configure logging
 def setup_logging():
-    """Setup professional logging system"""
+    """Setup professional logging system with log rotation."""
     log_dir = Path.home() / '.cryptopulse'
     log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / 'cryptopulse.log'
+
+    # Get the root logger
+    logger = logging.getLogger('CryptoPulse')
+    logger.setLevel(logging.INFO)
+
+    # Prevent adding handlers multiple times
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    # Create a rotating file handler
+    rotate_handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
+    rotate_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_dir / 'cryptopulse.log'),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    return logging.getLogger('CryptoPulse')
+    # Create a stream handler
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+    # Add the new handlers
+    logger.addHandler(rotate_handler)
+    logger.addHandler(stream_handler)
+
+    return logger
 
 logger = setup_logging()
 
@@ -441,6 +456,7 @@ class CryptoPulseMonitor:
     SCHEMA_VERSION = 1
     
     def __init__(self):
+        self.logger = logger
         logger.info("Initializing CryptoPulse Monitor...")
         
         # Settings with comprehensive defaults
