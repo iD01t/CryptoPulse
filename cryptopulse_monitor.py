@@ -58,6 +58,7 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 import traceback
 import argparse
+import random
 
 # Global exception hook for silent failure notifications
 def global_exception_hook(exc_type, exc_value, exc_traceback):
@@ -189,12 +190,12 @@ def check_and_install_dependencies() -> bool:
     
     return True
 
-# Install dependencies (skip in frozen builds)
-if not SKIP_INSTALLS:
+# Install dependencies (skip in frozen builds or testing)
+if not SKIP_INSTALLS and not os.environ.get('CRYPTOPULSE_TESTING'):
     if not check_and_install_dependencies():
         sys.exit(1)
 else:
-    logger.info("Skipping dependency installation in frozen build")
+    logger.info("Skipping dependency installation in frozen build or test environment")
 
 # Import all modules after dependency check
 try:
@@ -242,12 +243,13 @@ except ImportError as e:
 class NotificationManager:
     """Bulletproof notification system with win10toast → plyer → Tkinter fallback"""
     
-    def __init__(self, logger, debounce_seconds: float = 6.0):
+    def __init__(self, logger, debounce_seconds: float = 6.0, root=None):
         self.logger = logger
+        self.root = root
         self.debounce_seconds = debounce_seconds
         self._last_ts = 0.0
         self._lock = threading.Lock()
-        
+
         # Initialize win10toast on Windows for better reliability
         self.win10toast = None
         if os.name == "nt":
@@ -267,33 +269,54 @@ class NotificationManager:
             return False
 
     def notify(self, title: str, message: str, duration: int = 5):
-        """Bulletproof notification with win10toast → Tkinter fallback (skip plyer)"""
+        """Layered, threaded, debounced notifications with safe fallbacks."""
         if self._debounced():
-            print("Notification debounced (too frequent)")
+            self.logger.debug("Notification debounced (too frequent).")
             return
 
+        # Hard trim for long text
+        safe_title = (title[:77] + '...') if len(title) > 80 else title
+        safe_message = (message[:247] + '...') if len(message) > 250 else message
+
         def _worker():
-            # 1) Try win10toast first on Windows (most reliable)
+            # 1. Try Plyer
+            if NOTIFICATIONS_AVAILABLE:
+                try:
+                    notification.notify(
+                        title=safe_title,
+                        message=safe_message,
+                        app_name='CryptoPulse Monitor',
+                        timeout=duration
+                    )
+                    self.logger.info("Notification sent via Plyer.")
+                    return
+                except Exception as e:
+                    self.logger.warning(f"Plyer notification failed: {e}. Trying next backend.")
+
+            # 2. Try win10toast on Windows
             if os.name == "nt" and self.win10toast:
                 try:
                     self.win10toast.show_toast(
-                        title=title,
-                        msg=message,
+                        title=safe_title,
+                        msg=safe_message,
                         duration=duration,
-                        threaded=True
+                        threaded=False  # Run in this worker thread
                     )
-                    print("Notification sent via win10toast")
+                    self.logger.info("Notification sent via win10toast.")
                     return
                 except Exception as e:
-                    print(f"win10toast failed: {e}")
+                    self.logger.warning(f"win10toast failed: {e}. Trying next backend.")
 
-            # 2) Skip plyer (causes crashes) - go directly to Tkinter
+            # 3. Fallback to Tkinter messagebox
             try:
-                from tkinter import messagebox
-                messagebox.showinfo(title, message)
-                print("Notification sent via Tkinter fallback")
+                # Ensure this is run on the main GUI thread
+                if hasattr(self, 'root') and self.root and self.root.winfo_exists():
+                    self.root.after(0, lambda: messagebox.showinfo(safe_title, safe_message))
+                    self.logger.info("Notification sent via Tkinter fallback.")
+                else:
+                    self.logger.warning("Cannot show Tkinter fallback, root window not available.")
             except Exception as e:
-                print(f"All notification methods failed: {e}")
+                self.logger.error(f"All notification methods failed: {e}")
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -341,62 +364,84 @@ class TimeFrame(Enum):
     TWENTY_FOUR_HOURS = "24H"
     SEVEN_DAYS = "7D"
 
+class ProviderStrategy(Enum):
+    """API provider selection strategy"""
+    FAILOVER = "failover"
+
+class ProviderManager:
+    """Manages API providers, failover, and blacklisting."""
+    def __init__(self, logger, providers: List[APIProvider], strategy: ProviderStrategy = ProviderStrategy.FAILOVER, primary_provider: Optional[APIProvider] = None):
+        self.logger = logger
+        self.all_providers = providers
+        self.primary_provider = primary_provider
+        self.strategy = strategy
+
+        self.blacklist = {}  # provider -> expiry_time
+        self.failure_counts = {p: 0 for p in providers}
+
+        self.max_failures = 3
+        self.blacklist_ttl = timedelta(minutes=5)
+        self.retry_delay_base = 10  # seconds
+
+    def get_ordered_providers(self) -> List[APIProvider]:
+        """Get the next available provider based on the strategy."""
+        now = datetime.now()
+
+        # Prune expired blacklists
+        for provider, expiry in list(self.blacklist.items()):
+            if now > expiry:
+                self.logger.info(f"Provider {provider.value} removed from blacklist.")
+                del self.blacklist[provider]
+                self.failure_counts[provider] = 0
+
+        # Get available providers
+        available_providers = [p for p in self.all_providers if p not in self.blacklist]
+
+        if not available_providers:
+            self.logger.warning("All providers are currently blacklisted.")
+            return []
+
+        # Order providers: primary first, then the rest
+        if self.primary_provider and self.primary_provider in available_providers:
+            ordered = [self.primary_provider]
+            ordered.extend([p for p in available_providers if p != self.primary_provider])
+            return ordered
+        else:
+            return available_providers
+
+    def report_failure(self, provider: APIProvider):
+        """Report a failure for a provider."""
+        if provider in self.failure_counts:
+            self.failure_counts[provider] += 1
+            self.logger.warning(f"Failure reported for {provider.value}. Count: {self.failure_counts[provider]}")
+            if self.failure_counts[provider] >= self.max_failures:
+                self.blacklist_provider(provider)
+
+    def blacklist_provider(self, provider: APIProvider, duration_seconds: int = 300):
+        """Blacklist a provider for a specified duration."""
+        expiry = datetime.now() + timedelta(seconds=duration_seconds)
+        self.blacklist[provider] = expiry
+        self.logger.warning(f"Provider {provider.value} blacklisted until {expiry}.")
+
+    def report_success(self, provider: APIProvider):
+        """Report a success for a provider."""
+        if provider in self.failure_counts:
+            self.failure_counts[provider] = 0
+            self.logger.info(f"Provider {provider.value} success reported, failure count reset.")
+
+    def get_retry_delay(self, provider: APIProvider) -> float:
+        """Get exponential backoff delay for retries"""
+        attempts = self.failure_counts.get(provider, 0)
+        delay = self.retry_delay_base * (2 ** min(attempts, 4))  # Cap multiplier
+        jitter = delay * 0.1
+        return min(delay + (random.random() * jitter * 2 - jitter), 300) # Cap at 5 minutes
+
 class CryptoPulseMonitor:
     """Professional Cryptocurrency Price Monitor Application - BULLETPROOF EDITION"""
+    SCHEMA_VERSION = 1
     
     def __init__(self):
         logger.info("Initializing CryptoPulse Monitor...")
-        
-        # Application state
-        self.current_price_data: Optional[PriceData] = None
-        self.last_price_data: Optional[PriceData] = None
-        self.price_history: List[PriceData] = []
-        self.alerts_history: List[Dict] = []
-        self.is_monitoring = True
-        self.is_first_check = True
-        self.api_failures = 0
-        self.max_api_failures = 3
-        self.current_timeframe = TimeFrame.TWENTY_FOUR_HOURS
-        self.shutdown_requested = False
-        
-        # Enhanced error handling attributes
-        self.api_failure_count = 0
-        self.max_failure_count = 10
-        self.last_api_call_time = 0
-        self.min_api_interval = 10.0  # Increased to 10 seconds between API calls
-        self.tray_running = False
-        self.tray_thread = None
-        self.rate_limit_reset_time = None
-        self.rate_limited_until = None
-        
-        # Enhanced rate limiting
-        self.api_provider_blacklist = {}  # Track rate limited providers
-        self.retry_attempts = {}  # Track retry attempts per provider
-        self.max_retry_attempts = 3
-        self.base_retry_delay = 30  # Base delay for retries
-        
-        # Performance optimization
-        self.cache_duration = 30  # Cache data for 30 seconds
-        self.last_cache_time = 0
-        self.cached_price_data = None
-        self.gui_initialized = False
-        
-        # Konami Code Easter egg
-        self.konami_sequence = ['Up', 'Up', 'Down', 'Down', 'Left', 'Right', 'Left', 'Right', 'Return', 'space']
-        self.konami_input = []
-        self.konami_activated = False
-        self.start_time = time.time()
-        self.cache_hits = 0
-        
-        # Tray lifecycle management
-        self.tray_lock = threading.Lock()
-        self.tray_running = False
-        self.tray_icon = None
-        self.tray_thread = None
-        self.tray_stop_event = threading.Event()
-        
-        # Monitoring thread management
-        self.monitoring_stop_event = threading.Event()
         
         # Settings with comprehensive defaults
         self.settings = {
@@ -423,6 +468,53 @@ class CryptoPulseMonitor:
                 'alert_history_count': 100
             }
         }
+
+        # Application state
+        self.current_price_data: Optional[PriceData] = None
+        self.last_price_data: Optional[PriceData] = None
+        self.price_history: List[PriceData] = []
+        self.alerts_history: List[Dict] = []
+        self.is_monitoring = True
+        self.is_first_check = True
+        self.current_timeframe = TimeFrame.TWENTY_FOUR_HOURS
+        self.shutdown_requested = False
+        self.last_successful_update_time = None
+        
+        # Enhanced error handling attributes
+        self.last_api_call_time = 0
+        self.min_api_interval = 10.0  # Increased to 10 seconds between API calls
+        self.tray_running = False
+        self.tray_thread = None
+        
+        # Performance optimization
+        self.cache_duration = 30  # Cache data for 30 seconds
+        self.last_cache_time = 0
+        self.cached_price_data = None
+        self.gui_initialized = False
+        
+        # API Provider Management
+        self.provider_manager = ProviderManager(
+            logger=logger,
+            providers=[APIProvider.COINGECKO, APIProvider.BINANCE, APIProvider.CRYPTOCOMPARE],
+            primary_provider=APIProvider(self.settings.get('api_provider', 'coingecko'))
+        )
+
+        # Konami Code Easter egg
+        self.konami_sequence = ['Up', 'Up', 'Down', 'Down', 'Left', 'Right', 'Left', 'Right', 'Return', 'space']
+        self.konami_input = []
+        self.konami_activated = False
+        self.start_time = time.time()
+        self.cache_hits = 0
+        
+        # Tray lifecycle management
+        self.tray_lock = threading.Lock()
+        self.tray_running = False
+        self.tray_icon = None
+        self.tray_thread = None
+        self.tray_stop_event = threading.Event()
+        
+        # Monitoring thread management
+        self.monitoring_stop_event = threading.Event()
         
         # Professional color scheme with enhanced contrast
         self.colors = {
@@ -504,17 +596,31 @@ class CryptoPulseMonitor:
         # Initialize bulletproof notification system
         self.notifier = NotificationManager(
             logger, 
-            debounce_seconds=6.0
+            debounce_seconds=6.0,
+            root=self.root
         )
         
         self.setup_system_tray()
         self.start_monitoring()
+        self.check_stale_data()
         
         logger.info("CryptoPulse Monitor initialized successfully")
 
     def setup_http_session(self) -> requests.Session:
-        """BULLETPROOF: Setup HTTP session with retry and connection pooling"""
+        """BULLETPROOF: Setup HTTP session with retry, pooling, and proxy support."""
         session = requests.Session()
+
+        # Add proxy support from environment variables
+        try:
+            proxies = {
+                'http': os.environ.get('HTTP_PROXY'),
+                'https': os.environ.get('HTTPS_PROXY'),
+            }
+            session.proxies = {k: v for k, v in proxies.items() if v}
+            if session.proxies:
+                logger.info(f"Using system proxies: {session.proxies}")
+        except Exception as e:
+            logger.warning(f"Could not set proxies from environment: {e}")
         
         # Retry strategy for transient failures
         retry_strategy = Retry(
@@ -571,32 +677,6 @@ class CryptoPulseMonitor:
         
         self.last_api_call_time = time.time()
     
-    def is_provider_blacklisted(self, provider: APIProvider) -> bool:
-        """Check if a provider is currently blacklisted due to rate limiting"""
-        if provider.value not in self.api_provider_blacklist:
-            return False
-        
-        blacklist_until = self.api_provider_blacklist[provider.value]
-        if time.time() < blacklist_until:
-            remaining = blacklist_until - time.time()
-            logger.debug(f"Provider {provider.value} blacklisted for {remaining:.1f}s more")
-            return True
-        
-        # Remove from blacklist if time has passed
-        del self.api_provider_blacklist[provider.value]
-        return False
-    
-    def blacklist_provider(self, provider: APIProvider, duration: int = 300) -> None:
-        """Blacklist a provider for a specified duration (default 5 minutes)"""
-        self.api_provider_blacklist[provider.value] = time.time() + duration
-        logger.warning(f"Provider {provider.value} blacklisted for {duration}s due to rate limiting")
-    
-    def get_retry_delay(self, provider: APIProvider) -> float:
-        """Get exponential backoff delay for retries"""
-        attempts = self.retry_attempts.get(provider.value, 0)
-        delay = self.base_retry_delay * (2 ** attempts)  # Exponential backoff
-        return min(delay, 300)  # Cap at 5 minutes
-
     def load_settings(self) -> None:
         """Load settings with error recovery"""
         try:
@@ -608,6 +688,11 @@ class CryptoPulseMonitor:
                 with open(settings_path, 'r', encoding='utf-8') as f:
                     saved_settings = json.load(f)
                 
+                # Check schema version and migrate if necessary
+                loaded_version = saved_settings.get('schema_version', 0)
+                if loaded_version < self.SCHEMA_VERSION:
+                    saved_settings = self.migrate_settings(saved_settings, loaded_version)
+
                 # Deep merge settings
                 self._merge_settings(self.settings, saved_settings)
                 logger.info("Settings loaded successfully")
@@ -627,6 +712,19 @@ class CryptoPulseMonitor:
                 else:
                     default[key] = value
 
+    def migrate_settings(self, settings: dict, from_version: int) -> dict:
+        """Migrate settings from an old schema version to the current one."""
+        self.logger.info(f"Migrating settings from version {from_version} to {self.SCHEMA_VERSION}...")
+
+        # Example of a future migration path
+        # if from_version < 2:
+        #     # Do something to update to version 2
+        #     pass
+
+        settings['schema_version'] = self.SCHEMA_VERSION
+        self.logger.info("Settings migration complete.")
+        return settings
+
     def save_settings(self) -> None:
         """Save settings with atomic write"""
         try:
@@ -635,9 +733,13 @@ class CryptoPulseMonitor:
             settings_path = settings_dir / 'settings.json'
             temp_path = settings_path.with_suffix('.tmp')
             
+            # Add schema version before saving
+            settings_to_save = self.settings.copy()
+            settings_to_save['schema_version'] = self.SCHEMA_VERSION
+
             # Atomic write
             with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(self.settings, f, indent=2, ensure_ascii=False)
+                json.dump(settings_to_save, f, indent=2, ensure_ascii=False)
             temp_path.replace(settings_path)
             
             logger.info("Settings saved successfully")
@@ -675,6 +777,7 @@ class CryptoPulseMonitor:
         # Create essential layout first (fast loading)
         self.create_header()
         self.create_status_bar()
+        self.create_error_banner()
         
         # Create loading indicator
         self.create_loading_indicator()
@@ -1072,6 +1175,37 @@ class CryptoPulseMonitor:
                                  style='Info.TLabel')
         version_label.pack(side='right')
 
+    def create_error_banner(self):
+        """Create the error banner frame, initially hidden."""
+        self.error_banner_frame = ttk.Frame(self.root, style='Error.TFrame', height=30)
+        self.error_banner_frame.pack_propagate(False)
+
+        self.error_banner_label = ttk.Label(self.error_banner_frame, style='Error.TLabel')
+        self.error_banner_label.pack(side='left', padx=(15, 0))
+
+        # Using a regular tk.Button for more styling control on the 'X'
+        close_btn = tk.Button(self.error_banner_frame, text="✕",
+                              command=self.hide_error_banner,
+                              bg=self.colors['error'], fg='white',
+                              activebackground=self.colors['error_hover'],
+                              activeforeground='white',
+                              border=0, font=('Segoe UI', 12, 'bold'),
+                              cursor='hand2')
+        close_btn.pack(side='right', padx=10)
+
+    def show_error_banner(self, message: str):
+        """Display the error banner with a message."""
+        if hasattr(self, 'error_banner_frame'):
+            self.error_banner_label.config(text=message)
+            self.error_banner_frame.pack(side='top', fill='x', before=self.status_bar)
+            self.error_banner_is_visible = True
+
+    def hide_error_banner(self):
+        """Hide the error banner."""
+        if hasattr(self, 'error_banner_frame') and self.error_banner_frame.winfo_viewable():
+            self.error_banner_frame.pack_forget()
+            self.error_banner_is_visible = False
+
     def _minimize_to_tray_safe(self):
         """Guard to avoid <Unmap> recursion when we withdraw()"""
         self._suppress_unmap = True
@@ -1119,85 +1253,57 @@ class CryptoPulseMonitor:
             self.quit_application()
 
     def minimize_to_tray(self) -> None:
-        """BULLETPROOF minimize to system tray with fresh icon creation and locking"""
-        if not SYSTEM_TRAY_AVAILABLE:
+        """Harden tray lifecycle with lock, daemon thread, single retry, and guaranteed resets."""
+        if not SYSTEM_TRAY_AVAILABLE or not self.settings.get('ui_config', {}).get('enable_system_tray', True):
             self.safe_iconify()
             return
-        
-        # Check if system tray is enabled in settings
-        if not self.settings.get('ui_config', {}).get('enable_system_tray', True):
-            logger.info("System tray disabled in settings, using iconify instead")
-            self.safe_iconify()
-            return
-        
-        # Cross-platform tray reliability check
-        import platform
-        system = platform.system().lower()
-        
-        # On macOS and Linux, tray can be unreliable, so we prefer iconify
-        if system in ['darwin', 'linux']:
-            logger.info(f"Tray not fully supported on {system}, using iconify instead")
-            self.safe_iconify()
-            return
-        
+
         with self.tray_lock:
-            # Always clean up any existing tray to prevent handle reuse
             if self.tray_running and self.tray_icon:
                 try:
                     self.tray_icon.stop()
                 except Exception as e:
-                    self.logger.warning(f"Tray stop issue: {e}")
+                    self.logger.warning(f"Previous tray stop issue: {e}")
                 finally:
-                    # Always reset state, even if stop() failed
                     self.tray_running = False
                     self.tray_icon = None
                     self.tray_thread = None
 
-            try:
-                # Create fresh tray image and icon
-                tray_img = self._make_tray_image()
-                menu = pystray.Menu(
-                    pystray.MenuItem("Restore", lambda i, it: self.restore_window()),
-                    pystray.MenuItem("Quit", lambda i, it: self.quit_application())
-                )
-                self.tray_icon = pystray.Icon("CryptoPulse", tray_img, "CryptoPulse Monitor", menu)
-                self.tray_thread = threading.Thread(target=self._run_tray, daemon=True)
-                self.tray_thread.start()
-                self.tray_running = True
-                self.logger.info("Tray icon started successfully")
-            except Exception as e:
-                self.logger.error(f"Tray start failed: {e}, retrying with fresh image...")
-                # Wait briefly and retry once with a completely fresh tray
-                time.sleep(0.5)
+            for attempt in range(2):
                 try:
-                    # Ensure we start completely fresh
-                    self.tray_icon = None
-                    self.tray_thread = None
-                    self.tray_running = False
-                    
-                    # Create completely fresh tray image and icon
                     tray_img = self._make_tray_image()
                     menu = pystray.Menu(
-                        pystray.MenuItem("Restore", lambda i, it: self.restore_window()),
-                        pystray.MenuItem("Quit", lambda i, it: self.quit_application())
+                        pystray.MenuItem("Restore", lambda: self.safe_after(0, self.restore_window)),
+                        pystray.MenuItem("Quit", lambda: self.safe_after(0, self.quit_application))
                     )
                     self.tray_icon = pystray.Icon("CryptoPulse", tray_img, "CryptoPulse Monitor", menu)
+
+                    # All tray operations in a daemon thread
                     self.tray_thread = threading.Thread(target=self._run_tray, daemon=True)
                     self.tray_thread.start()
                     self.tray_running = True
-                    self.logger.info("Tray retry successful")
-                except Exception as e2:
-                    self.logger.error(f"Tray retry also failed: {e2}, falling back to iconify")
-                    # Clean up any partial state
+
+                    self.logger.info(f"Tray start attempt {attempt + 1} successful.")
+                    if hasattr(self, 'root') and self.root and self.root.winfo_exists():
+                        self.root.withdraw()
+                    self.logger.info("Minimized to system tray")
+                    return
+
+                except Exception as e:
+                    self.logger.error(f"Tray start attempt {attempt + 1} failed: {e}")
+                    if self.tray_icon:
+                        try:
+                            self.tray_icon.stop()
+                        except: pass
+                    self.tray_running = False
                     self.tray_icon = None
                     self.tray_thread = None
-                    self.tray_running = False
-                    self.safe_iconify()
-                    return
-        
-        if hasattr(self, 'root') and self.root and self.root.winfo_exists():
-            self.root.withdraw()
-        self.logger.info("Minimized to system tray")
+
+                    if attempt == 0:
+                        time.sleep(0.5)
+
+            self.logger.error("All tray start attempts failed, falling back to iconify.")
+            self.safe_iconify()
 
     def safe_iconify(self) -> None:
         """Safely minimize window to taskbar with error handling"""
@@ -1407,20 +1513,20 @@ class CryptoPulseMonitor:
     def create_tray_menu(self) -> pystray.Menu:
         """Create professional system tray context menu"""
         def on_quit(icon, item):
-            self.quit_application()
+            self.safe_after(0, self.quit_application)
 
         def on_restore(icon, item):
-            self.root.after(0, self.restore_window)
+            self.safe_after(0, self.restore_window)
 
         def on_settings(icon, item):
-            self.root.after(0, self.show_settings)
+            self.safe_after(0, self.toggle_settings)
 
         return pystray.Menu(
             item('Show CryptoPulse', on_restore, default=True),
-            item('Toggle Monitoring', self.toggle_monitoring),
+            item('Toggle Monitoring', lambda: self.safe_after(0, self.toggle_monitoring)),
             pystray.Menu.SEPARATOR,
-            item('Settings', lambda: self.root.after(0, self.toggle_settings)),
-            item('About', lambda: self.root.after(0, self.show_about)),
+            item('Settings', on_settings),
+            item('About', lambda: self.safe_after(0, self.show_about)),
             pystray.Menu.SEPARATOR,
             item('Exit', on_quit)
         )
@@ -1519,103 +1625,78 @@ class CryptoPulseMonitor:
         logger.info("Monitoring loop stopped")
 
     def fetch_and_update_price(self) -> None:
-        """BULLETPROOF price fetching with intelligent provider rotation and caching"""
+        """BULLETPROOF price fetching with unified provider management"""
         try:
             # Check cache first for performance
             current_time = time.time()
-            if (self.cached_price_data and 
+            if (self.cached_price_data and
                 current_time - self.last_cache_time < self.cache_duration):
                 logger.debug("Using cached price data")
                 self.cache_hits += 1
-                try:
-                    self.safe_after(0, lambda: self.update_price_display(self.cached_price_data))
-                    self.safe_after(0, lambda: self.update_connection_status(
-                        "● Connected (cached)", self.colors['success']))
-                except Exception as e:
-                    logger.debug(f"Cache display update failed: {e}")
+                self.safe_after(0, lambda: self.update_price_display(self.cached_price_data))
+                self.safe_after(0, lambda: self.update_connection_status(
+                    "● Connected (cached)", self.colors['success']))
                 return
-            
+
             # Enforce rate limiting
             self.enforce_rate_limit()
-            
-            # Get available providers (excluding blacklisted ones)
-            all_providers = [APIProvider.COINGECKO, APIProvider.BINANCE, APIProvider.CRYPTOCOMPARE]
-            available_providers = [p for p in all_providers if not self.is_provider_blacklisted(p)]
-            
-            if not available_providers:
-                # All providers are blacklisted
+
+            # Get available providers from the manager
+            providers = self.provider_manager.get_ordered_providers()
+
+            if not providers:
                 self.safe_after(0, lambda: self.update_connection_status(
                     "● All APIs rate limited", self.colors['error']))
-                logger.warning("All API providers are currently rate limited")
+                logger.warning("All API providers are currently rate limited or failing.")
                 return
-            
-            # Honor primary provider setting first, but only if not blacklisted
-            primary = APIProvider(self.settings.get('api_provider', 'binance'))
-            if primary in available_providers:
-                providers = [primary] + [p for p in available_providers if p != primary]
-            else:
-                providers = available_providers
-                logger.info(f"Primary provider {primary.value} is blacklisted, using fallbacks")
-            
-            # Try each provider
+
+            # Try each provider in the ordered list
             for provider in providers:
                 try:
-                    # Update status with error handling
-                    try:
-                        self.safe_after(0, lambda: self.update_connection_status(
-                                f"● Fetching from {provider.value}...", self.colors['warning']))
-                    except Exception as status_error:
-                        logger.debug(f"Status update failed: {status_error}")
-                    
+                    self.safe_after(0, lambda: self.update_connection_status(
+                        f"● Fetching from {provider.value}...", self.colors['warning']))
+
                     price_data = self.fetch_price_from_provider(provider)
+
                     if price_data and self._validate_price_data(price_data):
-                        # Normalize data to ensure consistent fields across providers
-                        price_data = self._normalize_price_data(price_data)
+                        # Success!
+                        self.provider_manager.report_success(provider)
                         
-                        # Success - reset failure count and cache data
-                        self.api_failure_count = 0
+                        # Normalize and cache data
+                        price_data = self._normalize_price_data(price_data)
                         self.cached_price_data = price_data
                         self.last_cache_time = current_time
-                        
-                        # Update UI with bulletproof error handling
-                        try:
-                            self.current_api_provider = provider
-                            self.safe_after(0, lambda p=provider: self.api_provider_label.config(
-                                text=f"Provider: {p.value.title()}"))
-                            self.safe_after(0, lambda pd=price_data: self.update_price_display(pd))
-                            self.safe_after(0, lambda: self.update_connection_status(
-                                "● Connected", self.colors['success']))
-                        except Exception as ui_error:
-                            logger.debug(f"UI update failed: {ui_error}")
+
+                        # Update UI
+                        self.last_successful_update_time = datetime.now()
+                        self.current_api_provider = provider
+                        self.safe_after(0, self.hide_error_banner)
+                        self.safe_after(0, lambda p=provider: self.api_provider_label.config(
+                            text=f"Provider: {p.value.title()}"))
+                        self.safe_after(0, lambda pd=price_data: self.update_price_display(pd))
+                        self.safe_after(0, lambda: self.update_connection_status(
+                            "● Connected", self.colors['success']))
                         return
-                        
+
                 except Exception as e:
                     logger.warning(f"Provider {provider.value} failed: {e}")
-                    # Continue to next provider instead of crashing
+                    self.provider_manager.report_failure(provider)
                     continue
             
-            # All providers failed
-            self.api_failure_count += 1
-            error_msg = f"All API providers failed (attempt {self.api_failure_count})"
+            # If all providers failed
+            error_msg = "All API providers failed."
             logger.error(error_msg)
-            
+            self.safe_after(0, lambda: self.show_error_banner("All providers are down. Retrying automatically."))
             self.safe_after(0, lambda: self.update_connection_status(
-                f"● All APIs Failed ({self.api_failure_count})", self.colors['error']))
-            
+                f"● All APIs Failed", self.colors['error']))
             raise Exception(error_msg)
-            
+
         except Exception as e:
-            logger.error(f"Price fetch error: {e}")
-            self.api_failure_count += 1
+            logger.error(f"Price fetch loop error: {e}")
             raise
 
     def fetch_price_from_provider(self, provider: APIProvider) -> Optional[PriceData]:
         """Enhanced provider-specific fetching with intelligent rate limiting"""
-        # Check if provider is blacklisted
-        if self.is_provider_blacklisted(provider):
-            logger.debug(f"Provider {provider.value} is temporarily blacklisted")
-            return None
-        
         config = self.api_endpoints[provider]
         
         try:
@@ -1683,72 +1764,34 @@ class CryptoPulseMonitor:
         
         headers = self.get_api_headers()
         
-        # Retry logic with exponential backoff
-        max_retries = 3
-        for attempt in range(max_retries):
-            for url, params in urls:
-                try:
-                    response = self.session.get(url, params=params, headers=headers, timeout=config['timeout'])
-                    
-                    # Handle rate limiting with intelligent retry
-                    if response.status_code == 429:
-                        retry_after = int(response.headers.get('Retry-After', 60))
-                        self.logger.warning(f"Binance rate limited (attempt {attempt + 1}/{max_retries}), retry after {retry_after}s")
-                        
-                        if attempt < max_retries - 1:
-                            # Blacklist provider temporarily
-                            self.blacklist_provider(APIProvider.BINANCE, retry_after)
-                            # Wait before retry
-                            time.sleep(min(retry_after, 60))  # Cap wait time at 60 seconds
-                            continue
-                        else:
-                            # Final attempt failed, blacklist for longer
-                            self.blacklist_provider(APIProvider.BINANCE, 300)  # 5 minutes
-                            return None
-                    
-                    # Handle other HTTP errors
-                    if response.status_code != 200:
-                        self.logger.warning(f"Binance returned status {response.status_code}")
-                        if attempt < max_retries - 1:
-                            delay = self.get_retry_delay(APIProvider.BINANCE)
-                            self.logger.info(f"Retrying in {delay:.1f}s...")
-                            time.sleep(delay)
-                            continue
-                        else:
-                            return None
-                    
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    # Use bulletproof parser
-                    price, abs_change, pct = self._parse_binance_price_payload(data)
-                    
-                    # Success - reset retry attempts
-                    if APIProvider.BINANCE.value in self.retry_attempts:
-                        del self.retry_attempts[APIProvider.BINANCE.value]
-                    
-                    return PriceData(
-                        symbol=symbol,
-                        price=price,
-                        change_24h=abs_change,
-                        change_percent_24h=pct,
-                        timestamp=datetime.now(),
-                        volume_24h=float(data.get("quoteVolume") or data.get("volume") or 0.0),
-                        market_cap=None  # Binance endpoint does not provide market cap
-                    )
-                    
-                except Exception as e:
-                    self.logger.warning(f"Binance fetch attempt failed: {e}")
-                    continue
-            
-            # If all URLs failed for this attempt, wait before retrying
-            if attempt < max_retries - 1:
-                delay = self.get_retry_delay(APIProvider.BINANCE)
-                self.logger.info(f"All Binance endpoints failed, retrying in {delay:.1f}s...")
-                time.sleep(delay)
+        for url, params in urls:
+            try:
+                response = self.session.get(url, params=params, headers=headers, timeout=config['timeout'])
+
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get('Retry-After', 60))
+                    self.provider_manager.blacklist_provider(APIProvider.BINANCE, retry_after)
+                    self.logger.warning(f"Binance rate limited. Blacklisted for {retry_after}s.")
+                    return None
+
+                response.raise_for_status()
+                data = response.json()
+
+                price, abs_change, pct = self._parse_binance_price_payload(data)
+
+                return PriceData(
+                    symbol=symbol,
+                    price=price,
+                    change_24h=abs_change,
+                    change_percent_24h=pct,
+                    timestamp=datetime.now(),
+                    volume_24h=float(data.get("quoteVolume") or data.get("volume") or 0.0),
+                    market_cap=None
+                )
+            except Exception as e:
+                self.logger.warning(f"Binance fetch from {url} failed: {e}")
+                continue
         
-        # All attempts failed
-        self.logger.warning(f"Binance fetch failed after {max_retries} attempts")
         return None
 
     def fetch_from_coingecko_safe(self, config: dict) -> Optional[PriceData]:
@@ -1765,93 +1808,49 @@ class CryptoPulseMonitor:
         
         headers = self.get_api_headers()
         
-        # Retry logic with exponential backoff
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # Make request with comprehensive error handling
-                response = self.session.get(
-                    url, 
-                    params=params, 
-                    headers=headers, 
-                    timeout=config['timeout']
-                )
-                
-                # Handle rate limiting with intelligent retry
-                if response.status_code == 429:
-                    retry_after = int(response.headers.get('Retry-After', 60))
-                    logger.warning(f"CoinGecko rate limited (attempt {attempt + 1}/{max_retries}), retry after {retry_after}s")
-                    
-                    if attempt < max_retries - 1:
-                        # Blacklist provider temporarily
-                        self.blacklist_provider(APIProvider.COINGECKO, retry_after)
-                        # Wait before retry
-                        time.sleep(min(retry_after, 60))  # Cap wait time at 60 seconds
-                        continue
-                    else:
-                        # Final attempt failed, blacklist for longer
-                        self.blacklist_provider(APIProvider.COINGECKO, 300)  # 5 minutes
-                        continue
-                
-                response.raise_for_status()
-                
-                # Handle other HTTP errors
-                if response.status_code != 200:
-                    logger.warning(f"CoinGecko returned status {response.status_code}")
-                    if attempt < max_retries - 1:
-                        delay = self.get_retry_delay(APIProvider.COINGECKO)
-                        logger.info(f"Retrying in {delay:.1f}s...")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        response.raise_for_status()
-                
-                # Success - reset retry attempts
-                if APIProvider.COINGECKO.value in self.retry_attempts:
-                    del self.retry_attempts[APIProvider.COINGECKO.value]
-                
-                data = response.json()
-                crypto_data = data.get(self.settings['cryptocurrency'], {})
-                
-                if not crypto_data:
-                    raise ValueError(f"No data returned for {self.settings['cryptocurrency']}")
-                
-                currency = self.settings['vs_currency']
-                current_price = float(crypto_data.get(currency, 0))
-                change_percent = float(crypto_data.get(f'{currency}_24h_change', 0))
-                
-                if current_price <= 0:
-                    raise ValueError("Invalid price data received")
-                
-                # Calculate absolute change
-                absolute_change = current_price * (change_percent / 100.0)
-                
-                return PriceData(
-                    symbol=self.settings['cryptocurrency'].upper(),
-                    price=current_price,
-                    change_24h=absolute_change,
-                    change_percent_24h=change_percent,
-                    timestamp=datetime.now(),
-                    volume_24h=crypto_data.get(f'{currency}_24h_vol'),
-                    market_cap=crypto_data.get(f'{currency}_market_cap')
-                )
+        try:
+            response = self.session.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=config['timeout']
+            )
 
-            except Exception as e:
-                # Track retry attempts
-                if APIProvider.COINGECKO.value not in self.retry_attempts:
-                    self.retry_attempts[APIProvider.COINGECKO.value] = 0
-                self.retry_attempts[APIProvider.COINGECKO.value] += 1
-                
-                if attempt < max_retries - 1:
-                    delay = self.get_retry_delay(APIProvider.COINGECKO)
-                    logger.warning(f"CoinGecko attempt {attempt + 1} failed: {e}, retrying in {delay:.1f}s")
-                    time.sleep(delay)
-                    continue
-                else:
-                    logger.error(f"All CoinGecko attempts failed: {e}")
-                    raise
-        
-        return None
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 60))
+                self.provider_manager.blacklist_provider(APIProvider.COINGECKO, retry_after)
+                logger.warning(f"CoinGecko rate limited. Blacklisted for {retry_after}s.")
+                return None
+
+            response.raise_for_status()
+
+            data = response.json()
+            crypto_data = data.get(self.settings['cryptocurrency'], {})
+
+            if not crypto_data:
+                raise ValueError(f"No data returned for {self.settings['cryptocurrency']}")
+
+            currency = self.settings['vs_currency']
+            current_price = float(crypto_data.get(currency, 0))
+            change_percent = float(crypto_data.get(f'{currency}_24h_change', 0))
+
+            if current_price <= 0:
+                raise ValueError("Invalid price data received")
+
+            absolute_change = current_price * (change_percent / 100.0)
+
+            return PriceData(
+                symbol=self.settings['cryptocurrency'].upper(),
+                price=current_price,
+                change_24h=absolute_change,
+                change_percent_24h=change_percent,
+                timestamp=datetime.now(),
+                volume_24h=crypto_data.get(f'{currency}_24h_vol'),
+                market_cap=crypto_data.get(f'{currency}_market_cap')
+            )
+        except Exception as e:
+            logger.warning(f"CoinGecko fetch failed: {e}")
+            raise
 
 
     def fetch_from_cryptocompare_safe(self, config: dict) -> Optional[PriceData]:
@@ -1879,103 +1878,44 @@ class CryptoPulseMonitor:
         }
         headers = self.get_api_headers()
         
-        # Retry logic with exponential backoff
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = self.session.get(url, params=params, headers=headers, timeout=config['timeout'])
-                
-                # Handle rate limiting with intelligent retry
-                if response.status_code == 429:
-                    retry_after = int(response.headers.get('Retry-After', 60))
-                    self.logger.warning(f"CryptoCompare rate limited (attempt {attempt + 1}/{max_retries}), retry after {retry_after}s")
-                    
-                    if attempt < max_retries - 1:
-                        # Blacklist provider temporarily
-                        self.blacklist_provider(APIProvider.CRYPTOCOMPARE, retry_after)
-                        # Wait before retry
-                        time.sleep(min(retry_after, 60))  # Cap wait time at 60 seconds
-                        continue
-                    else:
-                        # Final attempt failed, blacklist for longer
-                        self.blacklist_provider(APIProvider.CRYPTOCOMPARE, 300)  # 5 minutes
-                        return None
-                
-                # Handle other HTTP errors
-                if response.status_code != 200:
-                    self.logger.warning(f"CryptoCompare returned status {response.status_code}")
-                    if attempt < max_retries - 1:
-                        delay = self.get_retry_delay(APIProvider.CRYPTOCOMPARE)
-                        self.logger.info(f"Retrying in {delay:.1f}s...")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        return None
-                
-                response.raise_for_status()
-                data = response.json()
-                
-                # Check for API errors
-                if 'Response' in data and data['Response'] == 'Error':
-                    self.logger.warning(f"CryptoCompare API error: {data.get('Message', 'Unknown error')}")
-                    if attempt < max_retries - 1:
-                        delay = self.get_retry_delay(APIProvider.CRYPTOCOMPARE)
-                        self.logger.info(f"Retrying in {delay:.1f}s...")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        return None
-                
-                raw = data.get('RAW', {})
-                cur = self.settings['vs_currency'].upper()
-                
-                if symbol not in raw or cur not in raw.get(symbol, {}):
-                    self.logger.warning("CryptoCompare returned incomplete data")
-                    if attempt < max_retries - 1:
-                        delay = self.get_retry_delay(APIProvider.CRYPTOCOMPARE)
-                        self.logger.info(f"Retrying in {delay:.1f}s...")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        return None
-                
-                crypto_data = raw[symbol][cur]
-                
-                price = float(crypto_data['PRICE'])
-                if price <= 0:
-                    self.logger.warning("Invalid price from CryptoCompare")
-                    if attempt < max_retries - 1:
-                        delay = self.get_retry_delay(APIProvider.CRYPTOCOMPARE)
-                        self.logger.info(f"Retrying in {delay:.1f}s...")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        return None
-                
-                # Success - reset retry attempts
-                if APIProvider.CRYPTOCOMPARE.value in self.retry_attempts:
-                    del self.retry_attempts[APIProvider.CRYPTOCOMPARE.value]
-                
-                return PriceData(
-                    symbol=symbol,
-                    price=price,
-                    change_24h=float(crypto_data['CHANGE24HOUR']),
-                    change_percent_24h=float(crypto_data['CHANGEPCT24HOUR']),
-                    timestamp=datetime.now(),
-                    volume_24h=float(crypto_data['VOLUME24HOURTO'])
-                )
-                
-            except Exception as e:
-                self.logger.warning(f"CryptoCompare attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    delay = self.get_retry_delay(APIProvider.CRYPTOCOMPARE)
-                    self.logger.info(f"Retrying in {delay:.1f}s...")
-                    time.sleep(delay)
-                else:
-                    self.logger.error(f"All CryptoCompare attempts failed: {e}")
-                    return None
-        
-        return None
+        try:
+            response = self.session.get(url, params=params, headers=headers, timeout=config['timeout'])
+
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 60))
+                self.provider_manager.blacklist_provider(APIProvider.CRYPTOCOMPARE, retry_after)
+                self.logger.warning(f"CryptoCompare rate limited. Blacklisted for {retry_after}s.")
+                return None
+
+            response.raise_for_status()
+            data = response.json()
+
+            if 'Response' in data and data['Response'] == 'Error':
+                raise ValueError(f"CryptoCompare API error: {data.get('Message', 'Unknown error')}")
+
+            raw = data.get('RAW', {})
+            cur = self.settings['vs_currency'].upper()
+
+            if symbol not in raw or cur not in raw.get(symbol, {}):
+                raise ValueError("CryptoCompare returned incomplete data")
+
+            crypto_data = raw[symbol][cur]
+            price = float(crypto_data['PRICE'])
+
+            if price <= 0:
+                raise ValueError("Invalid price from CryptoCompare")
+
+            return PriceData(
+                symbol=symbol,
+                price=price,
+                change_24h=float(crypto_data.get('CHANGE24HOUR')),
+                change_percent_24h=float(crypto_data.get('CHANGEPCT24HOUR')),
+                timestamp=datetime.now(),
+                volume_24h=float(crypto_data.get('VOLUME24HOURTO'))
+            )
+        except Exception as e:
+            self.logger.warning(f"CryptoCompare fetch failed: {e}")
+            raise
 
     def safe_after(self, delay: int, func, *args, **kwargs) -> None:
         """Safely call root.after() with window existence check"""
@@ -2037,9 +1977,11 @@ class CryptoPulseMonitor:
         self.change_label.config(text=change_text, foreground=change_color)
         
         # Update volume if available
-        if price_data.volume_24h:
+        if price_data.volume_24h is not None:
             volume_text = self.format_volume(price_data.volume_24h)
             self.volume_label.config(text=f"24H Volume: {volume_text}")
+        else:
+            self.volume_label.config(text="24H Volume: —")
         
         # Update timestamp
         self.update_label.config(
@@ -2072,8 +2014,10 @@ class CryptoPulseMonitor:
         
         self.is_first_check = False
 
-    def format_price_change(self, change: float, change_percent: float) -> Tuple[str, str]:
+    def format_price_change(self, change: Optional[float], change_percent: Optional[float]) -> Tuple[str, str]:
         """Format price change with appropriate color"""
+        if change is None or change_percent is None:
+            return "—", self.colors['text_secondary']
         if change > 0:
             return f"▲ +${abs(change):,.2f} (+{change_percent:.2f}%)", self.colors['success']
         elif change < 0:
@@ -2369,7 +2313,7 @@ class CryptoPulseMonitor:
         
         # Get last 24 hours of data
         last_24h = datetime.now() - timedelta(hours=24)
-        recent_prices = [p.price for p in self.price_history if p.timestamp > last_24h]
+        recent_prices = [p.price for p in self.price_history if p.timestamp > last_24h and p.price is not None]
         
         if recent_prices:
             high_24h = max(recent_prices)
@@ -2379,6 +2323,28 @@ class CryptoPulseMonitor:
             self.high_label.config(text=f"24H High: ${high_24h:,.2f}")
             self.low_label.config(text=f"24H Low: ${low_24h:,.2f}")
             self.avg_label.config(text=f"24H Average: ${avg_24h:,.2f}")
+        else:
+            self.high_label.config(text="24H High: —")
+            self.low_label.config(text="24H Low: —")
+            self.avg_label.config(text="24H Average: —")
+
+    def check_stale_data(self):
+        """Periodically check if the price data is stale and update UI."""
+        if self.last_successful_update_time:
+            stale_threshold = timedelta(seconds=self.settings['refresh_interval'] * 2)
+            if datetime.now() - self.last_successful_update_time > stale_threshold:
+                time_since_update = datetime.now() - self.last_successful_update_time
+                minutes, seconds = divmod(int(time_since_update.total_seconds()), 60)
+
+                # Check if the label exists and the window is open
+                if hasattr(self, 'update_label') and self.update_label.winfo_exists():
+                    self.update_label.config(
+                        text=f"Stale! Last update: {minutes}m {seconds}s ago",
+                        foreground=self.colors['warning']
+                    )
+
+        # Reschedule the check
+        self.safe_after(1000, self.check_stale_data)
 
     # GUI Event Handlers
     def toggle_monitoring(self) -> None:
@@ -3322,6 +3288,16 @@ ADVANCED FEATURES:
                     'foreground': self.colors['text_primary'],
                     'font': ('Segoe UI', 14, 'bold')
                 }
+            },
+            'Error.TFrame': {
+                'configure': {'background': self.colors['error']}
+            },
+            'Error.TLabel': {
+                'configure': {
+                    'background': self.colors['error'],
+                    'foreground': 'white',
+                    'font': ('Segoe UI', 10, 'bold')
+                }
             }
         }
         
@@ -3474,11 +3450,11 @@ ADVANCED FEATURES:
                     # Use placeholder value instead of estimate
                     price_data.market_cap = None  # Indicates data not available
             
-            # Ensure all numeric fields are properly typed (use 0.0 for None values)
-            price_data.volume_24h = float(price_data.volume_24h or 0.0)
-            price_data.market_cap = float(price_data.market_cap or 0.0)
-            price_data.change_24h = float(price_data.change_24h or 0.0)
-            price_data.change_percent_24h = float(price_data.change_percent_24h or 0.0)
+            # Ensure all numeric fields are properly typed, but keep None for missing data
+            price_data.volume_24h = float(price_data.volume_24h) if price_data.volume_24h is not None else None
+            price_data.market_cap = float(price_data.market_cap) if price_data.market_cap is not None else None
+            price_data.change_24h = float(price_data.change_24h) if price_data.change_24h is not None else None
+            price_data.change_percent_24h = float(price_data.change_percent_24h) if price_data.change_percent_24h is not None else None
             
             return price_data
             
@@ -3711,6 +3687,8 @@ Pillow>=8.0.0
 plyer>=2.1.0
 pystray>=0.19.0
 numpy>=1.21.0
+
+win10toast>=0.9   # For Windows notifications
 
 # Optional dependencies for enhanced functionality
 # pyinstaller>=4.0  # For creating executable
