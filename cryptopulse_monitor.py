@@ -466,8 +466,7 @@ class CryptoPulseMonitor:
                 'volume_spike': {'enabled': True, 'threshold': 300.0}
             },
             'debug': {
-                'force_startup_test': False,
-                'use_tkinter_fallback_only': False
+                'force_startup_test': False
             },
             'ui_config': {
                 'window_width': 1200, 'window_height': 800,
@@ -1899,10 +1898,6 @@ class CryptoPulseMonitor:
             ttk.Checkbutton(debug_frame, text="Force startup test on next launch",
                             variable=self.force_startup_test_var).pack(anchor='w')
 
-            self.use_tk_fallback_var = tk.BooleanVar(value=debug_settings.get('use_tkinter_fallback_only', False))
-            ttk.Checkbutton(debug_frame, text="Use Tkinter fallback only (for testing)",
-                            variable=self.use_tk_fallback_var).pack(anchor='w', pady=(5,0))
-
         except Exception as e:
             logger.error(f"Notifications settings creation failed: {e}")
 
@@ -1976,7 +1971,6 @@ class CryptoPulseMonitor:
                             variable=self.auto_minimize_var).pack(anchor='w')
             
             if not self.tray_manager.available:
-                minimize_check.config(state='disabled')
                 ttk.Label(ui_frame, text="(System tray not available)", 
                          foreground='gray').pack(anchor='w', pady=(2, 0))
             
@@ -2010,8 +2004,9 @@ class CryptoPulseMonitor:
             self.settings['data_retention']['price_history_hours'] = new_retention
             self.settings['ui_config']['auto_minimize'] = self.auto_minimize_var.get()
 
+            if 'debug' not in self.settings:
+                self.settings['debug'] = {}
             self.settings['debug']['force_startup_test'] = self.force_startup_test_var.get()
-            self.settings['debug']['use_tkinter_fallback_only'] = self.use_tk_fallback_var.get()
 
             self.save_settings()
             
