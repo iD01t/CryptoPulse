@@ -185,16 +185,8 @@ try:
     from PIL import Image, ImageTk, ImageDraw
     
     # Optional imports with graceful fallbacks
-    NOTIFICATIONS_AVAILABLE = False
     SYSTEM_TRAY_AVAILABLE = False
     
-    try:
-        from plyer import notification
-        NOTIFICATIONS_AVAILABLE = True
-        logger.info("Desktop notifications - available")
-    except ImportError:
-        logger.warning("Desktop notifications - unavailable")
-
     try:
         import pystray
         from pystray import MenuItem as item
@@ -208,6 +200,74 @@ except ImportError as e:
     print(f"Critical dependency missing: {e}")
     input("Press Enter to exit...")
     sys.exit(1)
+
+try:
+    from win10toast import ToastNotifier
+except Exception:
+    ToastNotifier = None
+try:
+    from plyer import notification as plyer_notification
+except Exception:
+    plyer_notification = None
+
+import threading, time, tkinter as _tk
+from tkinter import messagebox as _mb
+
+class NotificationManager:
+    def __init__(self, app, cooldown_seconds=8):
+        self.app = app
+        self.cooldown = cooldown_seconds
+        self._last = 0
+        self.backends = {'win10toast': False, 'plyer': False, 'tk': True}
+        self._toaster = None
+        self._detect()
+
+    def _detect(self):
+        logger.info("Notification backends:")
+        if ToastNotifier:
+            try:
+                self._toaster = ToastNotifier()
+                self.backends['win10toast'] = True
+                logger.info(" - win10toast: OK")
+            except Exception as e:
+                logger.warning(f" - win10toast fail: {e}")
+        if plyer_notification:
+            try:
+                _ = hasattr(plyer_notification, 'notify')
+                self.backends['plyer'] = True
+                logger.info(" - plyer: OK")
+            except Exception as e:
+                logger.warning(f" - plyer fail: {e}")
+        logger.info(" - tk: OK")
+
+    def notify(self, title, message, duration=5, force=False):
+        now = time.time()
+        if not force and (now - self._last) < self.cooldown:
+            logger.debug("Notification debounced.")
+            return False
+        self._last = now
+
+        def _run():
+            if self.backends['win10toast']:
+                try:
+                    self._toaster.show_toast(title, message, duration=max(1,int(duration)), threaded=True)
+                    logger.info("Notification via win10toast"); return
+                except Exception as e:
+                    logger.warning(f"win10toast failed: {e}")
+            if self.backends['plyer']:
+                try:
+                    plyer_notification.notify(title=title, message=message, timeout=max(1,int(duration)))
+                    logger.info("Notification via plyer"); return
+                except Exception as e:
+                    logger.warning(f"plyer failed: {e}")
+            try:
+                root = _tk.Tk(); root.withdraw()
+                _mb.showinfo(title, message, parent=root); root.destroy()
+                logger.info("Notification via tk")
+            except Exception as e:
+                logger.error(f"tk fallback failed: {e}")
+        threading.Thread(target=_run, daemon=True).start()
+        return True
 
 # Data classes for type safety
 @dataclass
@@ -234,46 +294,7 @@ class TimeFrame(Enum):
     TWENTY_FOUR_HOURS = "24H"
     SEVEN_DAYS = "7D"
 
-class SafeNotificationManager:
-    """Safe notification manager with fallbacks"""
-    
-    def __init__(self):
-        self.available = NOTIFICATIONS_AVAILABLE
-        self.last_notification = None
-        self.notification_cooldown = 5  # seconds
-        
-    def send_notification(self, title: str, message: str, timeout: int = 8) -> bool:
-        """Send notification with comprehensive error handling"""
-        if not self.available:
-            logger.debug("Notifications not available")
-            return False
-            
-        # Prevent notification spam
-        now = time.time()
-        if (self.last_notification and 
-            now - self.last_notification < self.notification_cooldown):
-            logger.debug("Notification cooldown active")
-            return False
-        
-        try:
-            # Clean message text
-            clean_title = str(title).strip()[:100]
-            clean_message = str(message).strip()[:500]
-            
-            notification.notify(
-                title=clean_title,
-                message=clean_message,
-                app_name="CryptoPulse Monitor",
-                timeout=timeout
-            )
-            
-            self.last_notification = now
-            logger.debug(f"Notification sent: {clean_title}")
-            return True
-            
-        except Exception as e:
-            logger.warning(f"Notification failed: {e}")
-            return False
+# Old NotificationManager removed. New one will be inserted below imports.
 
 class SafeSystemTray:
     """Safe system tray manager with fallbacks"""
@@ -388,12 +409,12 @@ class CryptoPulseMonitor:
         self.shutdown_requested = False
         self.gui_initialized = False
         
-        # Safe managers
-        self.notification_manager = SafeNotificationManager()
-        self.tray_manager = SafeSystemTray()
-        
-        # Default settings
+        # Default settings must be initialized before managers that use them
         self.settings = self.get_default_settings()
+
+        # Safe managers
+        self.notifier = NotificationManager(app=self, cooldown_seconds=8)
+        self.tray_manager = SafeSystemTray()
         
         # Professional color scheme
         self.colors = {
@@ -430,6 +451,7 @@ class CryptoPulseMonitor:
         
         # Initialize components
         self.load_settings()
+        self.load_app_state()
         logger.info("CryptoPulse Monitor initialized successfully")
 
     def get_default_settings(self) -> dict:
@@ -442,7 +464,12 @@ class CryptoPulseMonitor:
             'enable_notifications': True,
             'alert_config': {
                 'price_drop': {'enabled': True, 'threshold': 2.0},
-                'price_rise': {'enabled': False, 'threshold': 5.0}
+                'price_rise': {'enabled': False, 'threshold': 5.0},
+                'volume_spike': {'enabled': True, 'threshold': 300.0}
+            },
+            'debug': {
+                'force_startup_test': False,
+                'use_tkinter_fallback_only': False
             },
             'ui_config': {
                 'window_width': 1200, 'window_height': 800,
@@ -518,6 +545,49 @@ class CryptoPulseMonitor:
         except Exception as e:
             logger.error(f"Error saving settings: {e}")
 
+    def load_app_state(self) -> None:
+        """Loads application state from state.json."""
+        self.app_state = {}
+        try:
+            state_path = Path.home() / '.cryptopulse' / 'state.json'
+            if state_path.exists():
+                with open(state_path, 'r', encoding='utf-8') as f:
+                    self.app_state = json.load(f)
+                logger.info("Application state loaded.")
+        except Exception as e:
+            logger.warning(f"Could not load application state: {e}")
+
+    def save_app_state(self) -> None:
+        """Saves application state to state.json."""
+        try:
+            state_dir = Path.home() / '.cryptopulse'
+            state_dir.mkdir(exist_ok=True)
+            state_path = state_dir / 'state.json'
+            temp_path = state_path.with_suffix('.tmp')
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(self.app_state, f, indent=2)
+            temp_path.replace(state_path)
+            logger.debug("Application state saved.")
+        except Exception as e:
+            logger.error(f"Error saving application state: {e}")
+
+    def perform_startup_self_check(self):
+        """Performs a one-time notification self-check on startup."""
+        # Ensure this setting is checked safely
+        debug_settings = self.settings.get('debug', {})
+        force_test = debug_settings.get('force_startup_test', False)
+
+        if not self.app_state.get('startup_notification_sent') or force_test:
+            logger.info("Performing startup notification self-check...")
+            self.notifier.notify(
+                "CryptoPulse Ready",
+                "Notifications are enabled.",
+                duration=6,
+                force=True
+            )
+            self.app_state['startup_notification_sent'] = True
+            self.save_app_state()
+
     def setup_gui(self) -> bool:
         """Setup GUI with comprehensive error handling"""
         try:
@@ -550,6 +620,7 @@ class CryptoPulseMonitor:
             # Bind events
             self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
             self.root.bind("<Configure>", self.on_window_configure)
+            self.root.bind_all('<F9>', self.run_test_notification)
             
             # Set icon
             self.set_window_icon()
@@ -636,6 +707,10 @@ class CryptoPulseMonitor:
             controls_frame.pack(side='right', padx=20, pady=15)
             
             # Buttons
+            test_btn = self.create_button(controls_frame, "Test Notif",
+                                         self.colors['secondary'], self.run_test_notification)
+            test_btn.pack(side='right', padx=5)
+
             self.settings_btn = self.create_button(controls_frame, "Settings", 
                                                  self.colors['primary'], self.toggle_settings)
             self.settings_btn.pack(side='right', padx=5)
@@ -911,6 +986,11 @@ class CryptoPulseMonitor:
             
             self.next_update_label = ttk.Label(status_content, text="Next update: ---", style='Info.TLabel')
             self.next_update_label.pack(anchor='w', pady=(5, 0))
+
+            # Manual notify button
+            manual_notify_btn = self.create_button(status_card, "Notify Now",
+                                                   self.colors['accent'], self.run_manual_notification)
+            manual_notify_btn.pack(fill='x', padx=20, pady=(10, 15))
             
         except Exception as e:
             logger.error(f"Status card creation failed: {e}")
@@ -1326,6 +1406,16 @@ class CryptoPulseMonitor:
                 
                 self.trigger_alert("Price Rise",
                     f"{current_data.symbol} rose {absolute_change_percent:.2f}% to ${current_data.price:,.2f}")
+
+            # Volume spike alert
+            if (last_data.volume_24h and current_data.volume_24h and last_data.volume_24h > 0 and
+                self.settings['alert_config']['volume_spike']['enabled']):
+
+                volume_change_percent = ((current_data.volume_24h - last_data.volume_24h) / last_data.volume_24h) * 100
+
+                if volume_change_percent >= self.settings['alert_config']['volume_spike']['threshold']:
+                    self.trigger_alert("Volume Spike",
+                        f"{current_data.symbol} 24h volume spiked {volume_change_percent:.0f}%")
                     
         except Exception as e:
             logger.error(f"Alert check failed: {e}")
@@ -1337,10 +1427,8 @@ class CryptoPulseMonitor:
             
             # Send notification
             if self.settings['enable_notifications']:
-                success = self.notification_manager.send_notification(
-                    f"CryptoPulse: {alert_type}", message)
-                if not success:
-                    logger.debug("Notification failed or on cooldown")
+                self.notifier.notify(
+                    f"CryptoPulse: {alert_type}", message, duration=6)
             
             # Add to history
             alert_record = {
@@ -1547,6 +1635,34 @@ class CryptoPulseMonitor:
         except Exception as e:
             logger.debug(f"Statistics update failed: {e}")
 
+    def run_test_notification(self, event=None):
+        """Sends a test notification. The 'event' param allows binding."""
+        logger.info("Running test notification.")
+        self.notifier.notify(
+            "CryptoPulse Test",
+            "Notifications are working.",
+            duration=6,
+            force=True
+        )
+
+    def run_manual_notification(self, event=None):
+        """Sends a notification with the current price data."""
+        if self.current_price_data:
+            logger.info("Running manual price notification.")
+            data = self.current_price_data
+            crypto_name = self.get_crypto_display_name().split('/')[0]
+            title = f"{crypto_name} Update"
+            message = f"Price: ${data.price:,.2f}\n24h Change: {data.change_percent_24h:.2f}%"
+            self.notifier.notify(
+                title,
+                message,
+                duration=6,
+                force=True
+            )
+        else:
+            logger.warning("Could not send manual notification, no price data available.")
+            self.safe_show_warning("No Data", "Cannot send notification until price data is loaded.")
+
     # GUI Event Handlers
     def toggle_monitoring(self) -> None:
         """Toggle monitoring with safe UI updates"""
@@ -1685,7 +1801,7 @@ class CryptoPulseMonitor:
         try:
             self.settings_window = tk.Toplevel(self.root)
             self.settings_window.title("CryptoPulse Settings")
-            self.settings_window.geometry("580x750")
+            self.settings_window.geometry("600x800")
             self.settings_window.configure(bg=self.colors['background'])
             self.settings_window.resizable(False, False)
             self.settings_window.transient(self.root)
@@ -1694,24 +1810,51 @@ class CryptoPulseMonitor:
             # Center window
             self.settings_window.geometry("+{}+{}".format(
                 self.root.winfo_rootx() + 50, self.root.winfo_rooty() + 30))
+
+            # Main content frame
+            main_frame = ttk.Frame(self.settings_window)
+            main_frame.pack(fill='both', expand=True, padx=10, pady=10)
             
             # Create notebook
-            notebook = ttk.Notebook(self.settings_window)
-            notebook.pack(fill='both', expand=True, padx=20, pady=20)
+            notebook = ttk.Notebook(main_frame)
+            notebook.pack(fill='both', expand=True, padx=10, pady=10)
             
             # Tabs
             general_frame = ttk.Frame(notebook)
+            notifications_frame = ttk.Frame(notebook)
             alerts_frame = ttk.Frame(notebook)
             advanced_frame = ttk.Frame(notebook)
             
             notebook.add(general_frame, text='General')
+            notebook.add(notifications_frame, text='Notifications')
             notebook.add(alerts_frame, text='Alerts')
             notebook.add(advanced_frame, text='Advanced')
             
             # Create tab content
             self.create_general_settings(general_frame)
+            self.create_notifications_settings(notifications_frame)
             self.create_alerts_settings(alerts_frame)
             self.create_advanced_settings(advanced_frame)
+
+            # Action buttons frame
+            buttons_frame = ttk.Frame(main_frame)
+            buttons_frame.pack(fill='x', padx=20, pady=(10, 20))
+
+            save_btn = self.create_button(buttons_frame, "Save & Close",
+                                        self.colors['success'], self.save_settings_gui)
+            save_btn.pack(side='left', padx=(0, 10))
+
+            reset_btn = self.create_button(buttons_frame, "Reset",
+                                         self.colors['warning'], self.reset_settings)
+            reset_btn.pack(side='left', padx=(0, 10))
+
+            cancel_btn = self.create_button(buttons_frame, "Cancel",
+                                          self.colors['secondary'],
+                                          lambda: self.settings_window.destroy())
+            cancel_btn.pack(side='right')
+
+            # Update diagnostics on open
+            self.update_diagnostics_panel()
             
         except Exception as e:
             logger.error(f"Settings window creation failed: {e}")
@@ -1754,23 +1897,43 @@ class CryptoPulseMonitor:
         except Exception as e:
             logger.error(f"General settings creation failed: {e}")
 
-    def create_alerts_settings(self, parent) -> None:
-        """Create alerts settings"""
+    def create_notifications_settings(self, parent) -> None:
+        """Create notification settings tab"""
         try:
-            # Notifications
-            notif_frame = ttk.LabelFrame(parent, text="Notification Settings", padding=15)
+            # General Notification Settings
+            notif_frame = ttk.LabelFrame(parent, text="General Notification Settings", padding=15)
             notif_frame.pack(fill='x', padx=20, pady=15)
-            
+
             self.notifications_var = tk.BooleanVar(value=self.settings['enable_notifications'])
             notif_check = ttk.Checkbutton(notif_frame, text="Enable desktop notifications",
                                          variable=self.notifications_var)
             notif_check.pack(anchor='w')
             
-            if not self.notification_manager.available:
-                notif_check.config(state='disabled')
-                ttk.Label(notif_frame, text="(Notifications not available)", 
-                         foreground='gray').pack(anchor='w', pady=(2, 0))
-            
+            test_btn = self.create_button(notif_frame, "Run Test", self.colors['accent'], self.run_test_notification)
+            test_btn.pack(anchor='w', pady=(15,5))
+
+            # Debug Settings
+            debug_frame = ttk.LabelFrame(parent, text="Debug Options", padding=15)
+            debug_frame.pack(fill='x', padx=20, pady=15)
+
+            debug_settings = self.settings.get('debug', {})
+            self.force_startup_test_var = tk.BooleanVar(value=debug_settings.get('force_startup_test', False))
+            force_check = ttk.Checkbutton(debug_frame, text="Force startup test on next launch",
+                                          variable=self.force_startup_test_var)
+            force_check.pack(anchor='w')
+
+            self.use_tk_fallback_var = tk.BooleanVar(value=debug_settings.get('use_tkinter_fallback_only', False))
+            tk_fallback_check = ttk.Checkbutton(debug_frame, text="Use Tkinter fallback only (for testing)",
+                                                variable=self.use_tk_fallback_var)
+            tk_fallback_check.pack(anchor='w', pady=(5,0))
+
+        except Exception as e:
+            logger.error(f"Notifications settings creation failed: {e}")
+
+
+    def create_alerts_settings(self, parent) -> None:
+        """Create alerts settings"""
+        try:
             # Price drop alerts
             drop_frame = ttk.LabelFrame(parent, text="Price Drop Alerts", padding=15)
             drop_frame.pack(fill='x', padx=20, pady=15)
@@ -1804,7 +1967,24 @@ class CryptoPulseMonitor:
             rise_spin = tk.Spinbox(rise_frame, from_=0.1, to=50, increment=0.5,
                                   textvariable=self.rise_threshold_var, width=15)
             rise_spin.pack(anchor='w', pady=(5, 0))
-            
+
+            # Volume spike alerts
+            volume_frame = ttk.LabelFrame(parent, text="Volume Spike Alerts", padding=15)
+            volume_frame.pack(fill='x', padx=20, pady=15)
+
+            self.volume_enabled_var = tk.BooleanVar(
+                value=self.settings['alert_config']['volume_spike']['enabled'])
+            volume_check = ttk.Checkbutton(volume_frame, text="Enable volume spike alerts",
+                                          variable=self.volume_enabled_var)
+            volume_check.pack(anchor='w')
+
+            ttk.Label(volume_frame, text="Volume spike threshold (% increase):").pack(anchor='w', pady=(10, 0))
+            self.volume_threshold_var = tk.StringVar(
+                value=str(self.settings['alert_config']['volume_spike']['threshold']))
+            volume_spin = tk.Spinbox(volume_frame, from_=50, to=5000, increment=50,
+                                    textvariable=self.volume_threshold_var, width=15)
+            volume_spin.pack(anchor='w', pady=(5, 0))
+
         except Exception as e:
             logger.error(f"Alerts settings creation failed: {e}")
 
@@ -1848,25 +2028,9 @@ class CryptoPulseMonitor:
                 ttk.Label(ui_frame, text="(System tray not available)", 
                          foreground='gray').pack(anchor='w', pady=(2, 0))
             
-            # Buttons
-            buttons_frame = ttk.Frame(parent)
-            buttons_frame.pack(fill='x', padx=20, pady=20)
-            
-            save_btn = self.create_button(buttons_frame, "Save", 
-                                        self.colors['success'], self.save_settings_gui)
-            save_btn.pack(side='left', padx=(0, 10))
-            
-            reset_btn = self.create_button(buttons_frame, "Reset", 
-                                         self.colors['warning'], self.reset_settings)
-            reset_btn.pack(side='left', padx=(0, 10))
-            
-            cancel_btn = self.create_button(buttons_frame, "Cancel", 
-                                          self.colors['secondary'], 
-                                          lambda: self.settings_window.destroy())
-            cancel_btn.pack(side='right')
-            
         except Exception as e:
             logger.error(f"Advanced settings creation failed: {e}")
+
 
     def save_settings_gui(self) -> None:
         """Save settings from GUI with validation"""
@@ -1875,6 +2039,7 @@ class CryptoPulseMonitor:
             new_interval = max(10, int(self.interval_var.get()))
             new_drop_threshold = max(0.1, float(self.drop_threshold_var.get()))
             new_rise_threshold = max(0.1, float(self.rise_threshold_var.get()))
+            new_volume_threshold = max(1, float(self.volume_threshold_var.get()))
             new_retention = max(24, int(self.retention_var.get()))
             
             # Update settings
@@ -1883,16 +2048,22 @@ class CryptoPulseMonitor:
             self.settings['cryptocurrency'] = self.crypto_var.get()
             self.settings['vs_currency'] = self.currency_var.get()
             self.settings['api_provider'] = self.api_provider_var.get()
+
             self.settings['enable_notifications'] = self.notifications_var.get()
             
             self.settings['alert_config']['price_drop']['enabled'] = self.drop_enabled_var.get()
             self.settings['alert_config']['price_drop']['threshold'] = new_drop_threshold
             self.settings['alert_config']['price_rise']['enabled'] = self.rise_enabled_var.get()
             self.settings['alert_config']['price_rise']['threshold'] = new_rise_threshold
+            self.settings['alert_config']['volume_spike']['enabled'] = self.volume_enabled_var.get()
+            self.settings['alert_config']['volume_spike']['threshold'] = new_volume_threshold
             
             self.settings['data_retention']['price_history_hours'] = new_retention
             self.settings['ui_config']['auto_minimize'] = self.auto_minimize_var.get()
-            
+
+            self.settings['debug']['force_startup_test'] = self.force_startup_test_var.get()
+            self.settings['debug']['use_tkinter_fallback_only'] = self.use_tk_fallback_var.get()
+
             # Save to file
             self.save_settings()
             
@@ -1935,23 +2106,13 @@ class CryptoPulseMonitor:
             
             # Reset to defaults
             self.settings = self.get_default_settings()
-            
-            # Update GUI variables
-            if hasattr(self, 'interval_var'):
-                self.interval_var.set("30")
-                self.crypto_var.set("bitcoin")
-                self.currency_var.set("usd")
-                self.api_provider_var.set("coingecko")
-                self.notifications_var.set(True)
-                self.drop_enabled_var.set(True)
-                self.drop_threshold_var.set("2.0")
-                self.rise_enabled_var.set(False)
-                self.rise_threshold_var.set("5.0")
-                self.retention_var.set("168")
-                self.auto_minimize_var.set(False)
-            
             self.save_settings()
-            self.safe_show_info("Settings Reset", "Settings reset to defaults!")
+
+            # Re-open the settings window to reflect the changes
+            self.settings_window.destroy()
+            self.toggle_settings()
+
+            self.safe_show_info("Settings Reset", "Settings have been reset to default values.")
             logger.info("Settings reset to defaults")
             
         except Exception as e:
@@ -2189,6 +2350,9 @@ Platform: {platform.system()} {platform.release()}"""
             if (self.settings['ui_config']['auto_minimize'] and 
                 self.tray_manager.available):
                 self.root.after(2000, self.minimize_to_tray)
+
+            # Perform startup self-check after a short delay
+            self.root.after(1500, self.perform_startup_self_check)
             
             logger.info("CryptoPulse Monitor started successfully")
             
