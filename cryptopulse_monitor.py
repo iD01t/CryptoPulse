@@ -280,11 +280,17 @@ class NotificationManager:
             'total_attempts': 0, 'success': 0, 'failed': 0, 'debounced': 0, 'forced': 0,
             'by_backend': {'plyer': 0, 'win10toast': 0, 'tk': 0}
         }
+        feature/robust-notifications-v2.1.2
+        
+    def _detect_backends(self):
+        """Detect and log available notification backends."""
+        logger.info("Notification Backend Diagnostics:"
 
     def _detect_backends(self):
         """Detect and log available notification backends."""
         logger.info("Notification Backend Diagnostics:")
         
+        main
         # 1. Plyer
         global NOTIFICATIONS_AVAILABLE
         if NOTIFICATIONS_AVAILABLE:
@@ -558,12 +564,12 @@ class CryptoPulseMonitor:
         self.shutdown_requested = False
         self.gui_initialized = False
         
+        # Default settings must be initialized before managers that use them
+        self.settings = self.get_default_settings()
+
         # Safe managers
         self.notification_manager = NotificationManager(self)
         self.tray_manager = SafeSystemTray()
-        
-        # Default settings
-        self.settings = self.get_default_settings()
         
         # Professional color scheme
         self.colors = {
