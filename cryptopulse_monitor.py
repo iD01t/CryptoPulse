@@ -284,12 +284,20 @@ class NotificationManager:
         
     def _detect_backends(self):
         """Detect and log available notification backends."""
+        logger.info("Notification Backend Diagnostics:")
+
+
+        feature/robust-notifications-v2.1.2
+        
+    def _detect_backends(self):
+        """Detect and log available notification backends."""
         logger.info("Notification Backend Diagnostics:"
 
     def _detect_backends(self):
         """Detect and log available notification backends."""
         logger.info("Notification Backend Diagnostics:")
         
+        main
         main
         # 1. Plyer
         global NOTIFICATIONS_AVAILABLE
