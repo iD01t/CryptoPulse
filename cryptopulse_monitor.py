@@ -264,42 +264,24 @@ class Tooltip:
 
 class NotificationManager:
     """A robust, multi-backend notification manager with fallbacks and diagnostics."""
-    
+
     def __init__(self, app_instance):
         self.app = app_instance
         self.last_notification_time = 0
-        self.settings = app_instance.settings # Shortcut to app settings
+        self.settings = app_instance.settings
 
-        # Backend availability
         self.backends = {'plyer': False, 'win10toast': False, 'tk': True}
         self._win10toast_toaster = None
         self._detect_backends()
 
-        # Notification statistics
         self.stats = {
             'total_attempts': 0, 'success': 0, 'failed': 0, 'debounced': 0, 'forced': 0,
             'by_backend': {'plyer': 0, 'win10toast': 0, 'tk': 0}
         }
-        feature/robust-notifications-v2.1.2
-        
-    def _detect_backends(self):
-        """Detect and log available notification backends."""
-        logger.info("Notification Backend Diagnostics:")
-
-
-        feature/robust-notifications-v2.1.2
-        
-    def _detect_backends(self):
-        """Detect and log available notification backends."""
-        logger.info("Notification Backend Diagnostics:"
 
     def _detect_backends(self):
         """Detect and log available notification backends."""
         logger.info("Notification Backend Diagnostics:")
-        
-        main
-        main
-        # 1. Plyer
         global NOTIFICATIONS_AVAILABLE
         if NOTIFICATIONS_AVAILABLE:
             self.backends['plyer'] = True
@@ -307,7 +289,6 @@ class NotificationManager:
         else:
             logger.warning(" - Plyer: Unavailable (plyer library failed to import)")
 
-        # 2. win10toast (Windows only)
         if platform.system() == "Windows":
             try:
                 from win10toast import ToastNotifier
@@ -319,32 +300,21 @@ class NotificationManager:
             except Exception as e:
                 logger.error(f" - win10toast: Failed to initialize. Error: {e}")
 
-        # 3. Tkinter (always available as a fallback)
         logger.info(" - Tkinter: Available (as a fallback)")
 
     def send_notification(self, title: str, message: str, timeout: int = 8) -> bool:
         """DEPRECATED: Legacy method for internal compatibility. Use notify() instead."""
         self.notify(title, message, duration=timeout)
-        # Old method returned bool, let's keep that for compatibility, though it's less meaningful now
         return True
 
     def notify(self, title: str, message: str, duration: int = 5, *, force: bool = False, debounce_bypass: bool = False, backend_hint: str | None = None) -> None:
         """
         Send a notification using the best available backend with fallbacks.
-
-        Args:
-            title (str): The notification title.
-            message (str): The notification body.
-            duration (int): Display duration in seconds.
-            force (bool): Bypasses OS heuristics if possible (e.g., for win10toast).
-            debounce_bypass (bool): Ignores local cooldown.
-            backend_hint (str | None): Tries a specific backend first ("plyer", "win10toast", "tk").
         """
         self.stats['total_attempts'] += 1
         if force:
             self.stats['forced'] += 1
 
-        # 1. Handle debounce unless bypassed
         if not debounce_bypass:
             cooldown = self.settings.get('min_notification_interval', 6)
             now = time.time()
@@ -353,34 +323,26 @@ class NotificationManager:
                 self.stats['debounced'] += 1
                 return
 
-        # 2. Clean inputs
         clean_title = str(title).strip()[:100]
         clean_message = str(message).strip()[:500]
 
-        # 3. Determine backend order
         backend_order = []
-        # Use hint if provided and available
         if backend_hint and self.backends.get(backend_hint):
             backend_order.append(backend_hint)
 
-        # Add remaining backends in default priority
         default_order = ['plyer', 'win10toast', 'tk']
         for b in default_order:
             if b not in backend_order:
                 backend_order.append(b)
 
-        # 4. Loop through backends and attempt to send
         notification_sent = False
         for backend in backend_order:
-            # Skip unavailable backends
             if not self.backends.get(backend):
                 continue
             
-            # Skip if platform doesn't match
             if backend == 'win10toast' and platform.system() != "Windows":
                 continue
 
-            # Handle debug setting to force Tkinter
             use_tk_only = self.settings.get('debug', {}).get('use_tkinter_fallback_only', False)
             if use_tk_only and backend != 'tk':
                 logger.debug(f"Skipping '{backend}' due to 'Use Tkinter fallback only' debug setting.")
@@ -389,7 +351,6 @@ class NotificationManager:
             start_time = time.time()
             try:
                 logger.info(f"Attempting notification via backend: '{backend}'")
-
                 if backend == 'plyer':
                     notification.notify(
                         title=clean_title,
@@ -398,9 +359,7 @@ class NotificationManager:
                         timeout=duration
                     )
                     notification_sent = True
-
                 elif backend == 'win10toast':
-                    # threaded=True makes it non-blocking
                     self._win10toast_toaster.show_toast(
                         title=clean_title,
                         msg=clean_message,
@@ -408,7 +367,6 @@ class NotificationManager:
                         threaded=True
                     )
                     notification_sent = True
-
                 elif backend == 'tk':
                     if self._show_tkinter_notification(clean_title, clean_message, duration):
                         notification_sent = True
@@ -419,21 +377,18 @@ class NotificationManager:
                     self.stats['success'] += 1
                     self.stats['by_backend'][backend] += 1
                     self.last_notification_time = time.time()
-                    break  # Exit loop on first success
+                    break
 
             except Exception as e:
                 logger.warning(f"Backend '{backend}' failed: {e}", exc_info=False)
-                # Continue to next backend
 
         if not notification_sent:
             self.stats['failed'] += 1
             logger.error("All notification backends failed.")
-        
 
     def _show_tkinter_notification(self, title: str, message: str, duration: int) -> bool:
         """Fallback notification using a simple Tkinter window."""
         try:
-            # Use app's safe_gui_call to ensure thread safety
             self.app.safe_gui_call(lambda: self._create_tk_popup(title, message, duration))
             return True
         except Exception as e:
@@ -447,16 +402,11 @@ class NotificationManager:
         popup.configure(bg=self.app.colors['surface'])
         popup.transient(self.app.root)
         popup.attributes("-topmost", True)
-
-        # Center popup on the main window
         x = self.app.root.winfo_x() + (self.app.root.winfo_width() // 2) - 150
         y = self.app.root.winfo_y() + (self.app.root.winfo_height() // 2) - 50
         popup.geometry(f"350x100+{x}+{y}")
-
         label = ttk.Label(popup, text=message, wraplength=330, style='Info.TLabel', justify='center')
         label.pack(padx=20, pady=20, expand=True, fill='both')
-
-        # Auto-close after duration
         popup.after(duration * 1000, popup.destroy)
 
 class SafeSystemTray:
